@@ -5,6 +5,7 @@ import sys
 import select
 import threading
 import time
+import os
 
 interfaces = [] #stores a list of available interfaces IP addresses
 
@@ -17,33 +18,48 @@ MCAST_GRP = '224.0.0.9'
 MCAST_PORT = 5007
 MULTICAST_TTL = 20
 
+debug_enabled = False
+
+update_timer = 30
+
+class RoutingTableEntry():
+    def __init__(self,ip_address, subnet_mask, next_hop, metric):
+        self.dest_ip=ip_address
+        self.subnet_mask=subnet_mask
+        self.next_hop=next_hop
+        self.metric=metric
+
 class routingTable():
-    routing_table = {}
+    entries = []
 
     def __init__(self):
         for interface_ip in interfaces:
-            #self.add_entry(routingTableEntry(interface_ip, '0.0.0.0', 0))
-            self.routing_table.update({interface_ip: ['0.0.0.0', 0]})
+            self.entries.append(RoutingTableEntry(interface_ip, '255.255.255.0', '0.0.0.0', 0))
 
     def __repr__(self):
         str = "dest ip       next_hop    cost\n" + "------        --------    ----\n"
-        for dest_ip, next_hop_and_metric in self.routing_table.items():
-            str = str + "%s    %s    %d\n" % (dest_ip, next_hop_and_metric[0], next_hop_and_metric[1])
+        for entry in self.entries:
+            str = str + "%s    %s    %d\n" % (entry.dest_ip, entry.next_hop, entry.metric)
         return str
 
-    def update_routing_table(self, ip_address, next_hop, metric):
-        if self.routing_table.get(ip_address):
-            if metric < self.routing_table.get(ip_address)[1]:
-                self.routing_table.update({ip_address: [next_hop, metric]})
-        else:
-            self.routing_table.update({ip_address: [next_hop, metric]})
+    def update_routing_table(self, dest_ip, next_hop, metric):
+        isEntryFound = False
+        for entry in self.entries:
+            if entry.dest_ip == dest_ip:
+                if entry.metric > metric:
+                    entry.next_hop = next_hop
+                    entry.metric = metric
+                isEntryFound = True
+
+        if not isEntryFound:
+            self.entries.append(RoutingTableEntry(dest_ip, '255.255.255.0', next_hop, metric))
 
 
     def serialize(self):
         buffer = struct.pack('b', 1)
-        buffer += struct.pack('b', len(self.routing_table))
-        for dest_ip, next_hop_and_metric in self.routing_table.items():
-            buffer = buffer + struct.pack('4s4sH', socket.inet_aton(dest_ip), socket.inet_aton(next_hop_and_metric[0]), next_hop_and_metric[1])
+        buffer += struct.pack('b', len(self.entries))
+        for entry in self.entries:
+            buffer = buffer + struct.pack('4s4sH', socket.inet_aton(entry.dest_ip), socket.inet_aton(entry.next_hop), entry.metric)
 
         return buffer
 
@@ -77,7 +93,7 @@ class RipV2:
         global running
         while running:
             self.send(routing_table.serialize())
-            time.sleep(30)
+            time.sleep(int(update_timer))
 
     def send(self, message):
         for sock in self.sock_list:
@@ -103,7 +119,8 @@ class RipV2:
         global running
         while running:
             data, address = sock.recvfrom(1024)
-            #print("S-a receptionat ", str(data), " de la ", address)
+            if debug_enabled:
+                print("S-a receptionat ", str(data), " de la ", address)
             message_type = struct.unpack('b', data[:1])[0]
             data = data[1:]
             if message_type == 1:
@@ -113,21 +130,44 @@ class RipV2:
         threading.Thread(target=self.receive_fct, args=(self.sock_list[0],)).start()
 
 
-routing_table = routingTable()
-print(routing_table)
+def display_menu():
+    print("-------MENIU--------")
+    print("comenzi: routing table    - afisare tabela de routare")
+    print("         set update timer - setare timer pentru update-uri periodice")
+    print("         enable debug     - activeaza afisarea tuturor pachetelor care se primesc/trimit")
+    print("         disable debug    - dezactiveaza afisarea tuturor pachetelor care se primesc/trimit")
+    print("         menu             - afiseaza meniul")
+    print("         quit             - inchide procesul RipV2")
 
-running = True
-ripv2 = RipV2(routing_table)
-ripv2.recv()
-print("started receiving messages....")
-while True:
-    try:
-        data = input("Trimite: ")
+def get_user_command():
+    global debug_enabled
+    global update_timer
+    data = input("comanda: ")
 
-        if data == "--rtable":
-            print(routing_table)
-        else:
-            ripv2.send(bytes(data, encoding="ascii"))
-    except KeyboardInterrupt:
-        running = False
-        break
+    if data == "routing table":
+        print(routing_table)
+    elif data == "enable debug":
+        debug_enabled = True
+    elif data == "disable debug":
+        debug_enabled = False
+    elif data == "menu":
+        display_menu()
+    elif data == "set update timer":
+        update_timer = input("introduceti timer-ul: ")
+    elif data == "quit":
+        os._exit(0)
+
+if __name__ == '__main__':
+    routing_table = routingTable()
+    print(routing_table)
+
+    running = True
+    ripv2 = RipV2(routing_table)
+    ripv2.recv()
+    print("started receiving messages....")
+    while True:
+        try:
+            get_user_command()
+        except KeyboardInterrupt:
+            running = False
+            break
