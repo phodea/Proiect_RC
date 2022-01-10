@@ -1,4 +1,5 @@
 import socket
+import ipaddress
 import netifaces as ni
 import struct
 import sys
@@ -66,20 +67,23 @@ class routingTable():
 class RipV2:
     #we need to create a list of sockets for sending multicast packets thorugh every interface
     routing_table: routingTable
-    sock_list = []
 
-    def create_multicast_sock(self, host_ip):
+    #dictionary with socket : interface_ip pairs
+    sock_list = {}
+
+    def create_multicast_sock(self, interface_ip):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(host_ip))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface_ip))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
 
         #add membership to receive multicast messages
-        membership = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(host_ip))
+        membership = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton(interface_ip))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
         sock.bind((MCAST_GRP, MCAST_PORT))
-        self.sock_list.append(sock)
+
+        self.sock_list[sock] = interface_ip
 
     def __init__(self, routing_table):
         self.routing_table = routing_table
@@ -119,15 +123,24 @@ class RipV2:
         global running
         while running:
             data, address = sock.recvfrom(1024)
-            if debug_enabled:
-                print("S-a receptionat ", str(data), " de la ", address)
-            message_type = struct.unpack('b', data[:1])[0]
-            data = data[1:]
-            if message_type == 1:
-                self.process_reply_message(data, address[0])
+            interface_ip = self.sock_list[sock]
+
+            #since all sockets are bound to the same mcast_grp address, we need to check if the message is received on
+            #the correct interface ( checking if the sender is in the same network with the interface )
+            network1 = ipaddress.IPv4Network(interface_ip + '/255.255.255.0', strict=False)
+            network2 = ipaddress.IPv4Network(address[0] + '/255.255.255.0', strict=False)
+
+            if network1 == network2:
+                if debug_enabled:
+                    print("\nS-a receptionat ", str(data), " de la ", address, " pe ", self.sock_list[sock])
+                message_type = struct.unpack('b', data[:1])[0]
+                data = data[1:]
+                if message_type == 1:
+                    self.process_reply_message(data, address[0])
 
     def recv(self):
-        threading.Thread(target=self.receive_fct, args=(self.sock_list[0],)).start()
+        for socket in self.sock_list:
+            threading.Thread(target=self.receive_fct, args=(socket,)).start()
 
 
 def display_menu():
