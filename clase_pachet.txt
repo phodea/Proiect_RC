@@ -1,0 +1,84 @@
+class routingTableEntry():
+    entries=[]
+    def __init__(self, ip_address, subnet_mask, next_hop, metric):
+        self.subnet_mask = subnet_mask
+        self.ip_address = ip_address
+        self.next_hop = next_hop
+        self.metric = metric
+
+    def addEntry(self):
+        pass
+
+
+class RIPV2Entry():
+    FORMAT = "HHIIII"
+
+    def __init__(self, ip_address, subnet_mask, next_hop, metric):
+        self.afi = socket.AF_INET
+        self.route_tag = b'\x00\x00'
+        self.ip_address = ip_address
+        self.subnet_mask = subnet_mask
+        self.next_hop = next_hop
+        self.metric = metric
+
+    def serialize(self):
+        return struct.pack(self.FORMAT, self.afi, self.route_tag, self.ip_address,
+                           self.subnet_mask, self.next_hop, self.metric)
+
+
+class RIPV2Header():
+
+    C_REQUEST = b'\x01'
+    C_REPLY = b'\x02'
+
+    def __init__(self, command):
+        assert command == self.C_REQUEST or command == self.C_REPLY, "Invalid opcode"
+
+        self.command = command
+        self.version = b'\x02'
+        self.unused = b'\x00\x00'
+
+
+
+class RIPV2Packet(RIPV2Header):
+    FORMAT = "BBH"
+    TYPE_REPLY = b'\x02'
+    TYPE_REQUEST = b'\x01'
+
+    entries = []
+    noe=0
+
+    def __init__(self, ripv2type, routing_table: routingTableEntry):
+        if ripv2type == self.TYPE_REQUEST:
+            self.command = RIPV2Header.C_REQUEST
+        elif ripv2type == self.TYPE_REPLY:
+            self.command = RIPV2Header.C_REPLY
+
+        super(RIPV2Header, self).__init__(self.command)
+
+        for i in routing_table.entries:
+            self.entries.append(RIPV2Entry(i.ip_address, i.subnet_mask,
+                                       i.next_hop, i.metric))
+            self.noe=self.noe+1
+
+    def serialize_message(self):
+        packed = struct.pack(self.FORMAT, self.command, self.version, self.unused)
+        for i in self.entries:
+            packed += i.serialize()
+        return packed
+
+    def deserialize_message(message):
+        var=struct.unpack("BBH",message)
+        return var
+
+    def make_request_message(self):
+        # modificare corespunzatoare campuri
+        pass
+
+    def make_response_message(self, routing_table: routingTable):
+        # modificare corespunzatoare campuri
+
+        pass
+
+    def getEntries(self):
+        return self.entries
