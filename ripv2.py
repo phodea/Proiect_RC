@@ -1,3 +1,4 @@
+import datetime
 import socket
 import ipaddress
 import netifaces as ni
@@ -13,6 +14,7 @@ interfaces = [] #stores a list of available interfaces IP addresses
 for interface in ni.interfaces():
     if interface != "lo" and interface != "enp0s3":
         ip = ni.ifaddresses(interface)[ni.AF_INET][0]['addr']
+        print(interface)
         interfaces.append(ip)
 
 MCAST_GRP = '224.0.0.9'
@@ -23,37 +25,38 @@ debug_enabled = False
 
 update_timer = 30
 
-class RoutingTableEntry():
-    def __init__(self,ip_address, subnet_mask, next_hop, metric):
-        self.dest_ip=ip_address
-        self.subnet_mask=subnet_mask
-        self.next_hop=next_hop
-        self.metric=metric
-
 class routingTable():
     entries = []
 
     def __init__(self):
         for interface_ip in interfaces:
-            self.entries.append(RoutingTableEntry(interface_ip, '255.255.255.0', '0.0.0.0', 0))
+            self.entries.append(RIPv2RouteEntry(interface_ip, '255.255.255.0', '0.0.0.0', 0))
 
     def __repr__(self):
         str = "dest ip       next_hop    cost\n" + "------        --------    ----\n"
         for entry in self.entries:
-            str = str + "%s    %s    %d\n" % (entry.dest_ip, entry.next_hop, entry.metric)
+            str = str + "%s    %s    %d\n" % (entry.address, entry.next_hop, entry.metric)
         return str
 
-    def update_routing_table(self, dest_ip, next_hop, metric):
-        isEntryFound = False
-        for entry in self.entries:
-            if entry.dest_ip == dest_ip:
-                if entry.metric > metric:
-                    entry.next_hop = next_hop
-                    entry.metric = metric
-                isEntryFound = True
+    def update(self, received_entries, next_hop):
+        changedEntries = []
+        for rte in received_entries:
+            isEntryFound = False
+            for entry in self.entries:
+                if entry.address == rte.address:
+                    if entry.metric > rte.metric + 1:
+                        entry.next_hop = rte.next_hop
+                        entry.metric = rte.metric + 1
+                        entry.isChanged = True
+                        changedEntries.append(entry)
+                    isEntryFound = True
 
-        if not isEntryFound:
-            self.entries.append(RoutingTableEntry(dest_ip, '255.255.255.0', next_hop, metric))
+            if not isEntryFound:
+                new_entry = RIPv2RouteEntry(rte.address, '255.255.255.0', next_hop, rte.metric + 1)
+                new_entry.isChanged = True
+                changedEntries.append(new_entry)
+                self.entries.append(new_entry)
+        return changedEntries
 
 
     def serialize(self):
@@ -63,6 +66,104 @@ class routingTable():
             buffer = buffer + struct.pack('4s4sH', socket.inet_aton(entry.dest_ip), socket.inet_aton(entry.next_hop), entry.metric)
 
         return buffer
+
+class RIPv2RouteEntry:
+    FORMAT = "HH4s4s4sI"
+    SIZE = struct.calcsize(FORMAT)
+    MIN_METRIC = 0
+    MAX_METRIC = 16
+
+    def __init__(self, *args):#address, subnet_mask, next_hop, metric):
+        if len(args) == 1:
+            self.init_entry_from_serialized_message(message=args[0])
+        elif len(args) == 4:
+            self.addr_family_id = socket.AF_INET
+            self.route_tag = 0  # must be 0
+            self.address = args[0]
+            self.subnet_mask = args[1]
+            self.next_hop = args[2]
+            self.metric = args[3]
+
+            self.isChanged = False
+            self.garbage = False
+
+            self.resetTimer()
+
+    def init_entry_from_serialized_message(self, message):
+        self.addr_family_id, self.route_tag, address, subnet_mask, next_hop, self.metric = \
+        struct.unpack(self.FORMAT, message)
+
+        self.address = socket.inet_ntoa(address)
+        self.subnet_mask = socket.inet_ntoa(subnet_mask)
+        self.next_hop = socket.inet_ntoa(next_hop)
+
+    def resetTimer(self):
+        self.timeout = datetime.datetime.now()
+
+    def serialize(self):
+        return struct.pack(self.FORMAT,
+                           self.addr_family_id,
+                           self.route_tag,
+                           socket.inet_aton(self.address),
+                           socket.inet_aton(self.subnet_mask),
+                           socket.inet_aton(self.next_hop),
+                           self.metric)
+
+class RIPV2Header():
+    FORMAT = "BBH"
+    SIZE = struct.calcsize(FORMAT)
+    REQUEST = 1
+    REPLY = 2
+
+    def __init__(self, data):
+        time.sleep(int(1))
+        if isinstance(data, int):
+            assert data == self.REQUEST or data == self.REPLY, "Invalid opcode"
+
+            self.command = data
+            self.version = 2
+            self.unused = 0
+        elif isinstance(data, bytes):
+            self.init_header_from_serialized_message(message=data)
+
+    #deserialize a ripv2 header
+    def init_header_from_serialized_message(self, message):
+        self.command, self.version, self.unused = struct.unpack(self.FORMAT, message)
+
+    def serialize(self):
+        return struct.pack(self.FORMAT, self.command, self.version, self.unused)
+
+class RIPV2Packet(RIPV2Header):
+    entries = []
+
+    def __init__(self, *args):
+        if len(args) == 1:
+            self.init_packet_from_serialized_message(message=args[0])
+        elif len(args) == 2:
+            super().__init__(args[0])#command
+            self.entries = args[1]   #routing table entries (list)
+
+    #deserialize a ripv2 packet
+    def init_packet_from_serialized_message(self, message):
+        number_of_entries = int((len(message) - RIPV2Header.SIZE) / RIPv2RouteEntry.SIZE)
+        index = 0
+
+        #deserialize the header
+        super().__init__(message[index:RIPV2Header.SIZE])
+        index += RIPV2Header.SIZE
+
+        #deserialize the entries
+        for i in range(number_of_entries):
+            self.entries.append(RIPv2RouteEntry(message[index:index + RIPv2RouteEntry.SIZE]))
+            index += RIPv2RouteEntry.SIZE
+
+    def serialize_message(self):
+        packed = super().serialize()
+
+        for entry in self.entries:
+            packed += entry.serialize()
+
+        return packed
 
 class RipV2:
     #we need to create a list of sockets for sending multicast packets thorugh every interface
@@ -88,36 +189,30 @@ class RipV2:
     def __init__(self, routing_table):
         self.routing_table = routing_table
         for interface_ip in interfaces:
-            print("creating mcast sock for %s" % interface_ip)
             self.create_multicast_sock(interface_ip)
-        threading.Thread(target=self.periodic_updates).start()
+        threading.Thread(target=self.periodic_update).start()
 
 
-    def periodic_updates(self):
+    def periodic_update(self):
         global running
         while running:
-            self.send(routing_table.serialize())
+            self.send(RIPV2Packet(RIPV2Header.REPLY, self.routing_table.entries).serialize_message())
             time.sleep(int(update_timer))
+
+    def triggered_updates(self, changed_entries):
+        packet = RIPV2Packet(RIPV2Header.REPLY, changed_entries)
+        self.send(packet.serialize())
 
     def send(self, message):
         for sock in self.sock_list:
             #print("sending %s...." % message)
             sock.sendto(bytes(message), (MCAST_GRP, MCAST_PORT))
 
-    def process_reply_message(self, data, source_ip):
-        number_of_entries = struct.unpack('b', data[:1])[0]
-        data = data[1:]
+    def process_reply_message(self, entries, source_ip):
+        changed_entries = self.routing_table.update(entries, source_ip)
 
-        for i in range(1, number_of_entries + 1):
-            dest_ip = socket.inet_ntoa(struct.unpack('4s', data[:4])[0])
-            data = data[4:]
-            next_hop = socket.inet_ntoa(struct.unpack('4s', data[:4])[0])
-            data = data[4:]
-            metric = struct.unpack('H', data[:2])[0]
-            metric += 1
-            data = data[2:]
-
-            self.routing_table.update_routing_table(dest_ip, source_ip, metric)
+        if len(changed_entries) > 0:
+            self.triggered_updates(changed_entries)
 
     def receive_fct(self, sock):
         global running
@@ -133,11 +228,10 @@ class RipV2:
             if network1 == network2:
                 if debug_enabled:
                     print("\nS-a receptionat ", str(data), " de la ", address, " pe ", self.sock_list[sock])
-                message_type = struct.unpack('b', data[:1])[0]
-                data = data[1:]
-                if message_type == 1:
-                    self.process_reply_message(data, address[0])
+                packet = RIPV2Packet(data)
 
+                if packet.command == RIPV2Header.REPLY:
+                    self.process_reply_message(packet.entries, address[0])
     def recv(self):
         for socket in self.sock_list:
             threading.Thread(target=self.receive_fct, args=(socket,)).start()
